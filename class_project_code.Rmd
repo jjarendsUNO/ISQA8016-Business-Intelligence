@@ -1,0 +1,329 @@
+---
+title: "Board Games"
+author: "Justin Arends"
+date: "2022-09-24"
+output: rmarkdown::github_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=TRUE, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+
+
+details <- read_csv("games_detailed_info.csv")%>% janitor::clean_names()
+```
+
+# Preparing the Data
+
+**The Goal**
+
+>> Can we predict how many board games we can sell based on the data elements we have. As a business, it would be important for us to know what variables of interest drive sales for our customers as we go about creating new board games.
+
+I'm going to clean up the data and create some factor variables. I'm going to combine the two columns from the game details `Owned` and `Trading.` From what little information I could find, I think it is safe to assume that the combination of these two indicate the total games purchased.
+
+I'll also be creating a factor variable where I have cut the `Total` games sold into roughly equal size groups. This grouping will be used in the next step to determine what board game categories and what board game descriptions are likely to result in more sales.
+
+```{r}
+clean_details <- 
+  details %>%
+  select(id, minplayers, maxplayers,
+         boardgamecategory, description,
+         playingtime, minage, owned, trading) %>%
+  mutate(total = owned + trading) %>%
+  mutate(total_cuts = cut(total, breaks = c(0, 150, 500, 1000,
+                                            Inf),
+                          include.lowest= T,
+                          labels = c("150", "500", "1000", "200000")
+                          ),
+         ) %>%
+  mutate(boardgamecategory = gsub("[[:punct:]]", "", boardgamecategory))  
+
+
+
+clean_details %>% 
+  count(total_cuts) 
+
+```
+
+
+## Getting board category words (feature selection)
+
+The goal here is to understand if the words used to describe the board game (in the `boardcategory` column) are related to to the total number of games sold
+
+Here are the word counts for the words used in the Board Game Category:
+
+```{r}
+library(tidytext)
+
+details_tidy <- 
+  clean_details %>%
+  unnest_tokens(word, boardgamecategory) %>%
+  anti_join(get_stopwords()) %>%
+  filter(word != "game") %>%
+  mutate(word = gsub("[[:punct:]]", "", word))
+
+
+
+details_tidy %>%
+  count(word, sort = TRUE)  
+  
+```
+
+Now that we have the word counts, let's go ahead and focus on the top 100 words used. With these top 100 words, we're going to look at, by `total_cuts`, how many words were used, how many time the Top 100 word was used, and find the percentage of how many times that word was used overall. This essentially is a term frequency matrix of sorts.
+
+This information will be used to model the relationship between the word and the `total_cuts` variable.
+
+```{r}
+top_words <-
+  details_tidy %>%
+  count(word, sort = TRUE) %>%
+  slice_max(n, n = 100) %>%
+  pull(word)
+
+
+word_freqs <-
+  details_tidy %>%
+  count(word, total_cuts) %>%
+  complete(word, total_cuts, fill = list(n = 0)) %>%
+  group_by(total_cuts) %>%
+  mutate(
+    total = sum(n),
+    proportion = n / total
+  ) %>%
+  ungroup() %>%
+  filter(word %in% top_words) %>%
+  # Need to turn the total_cuts into a numeric data for prediction
+  mutate(total_cuts = as.numeric(as.character(total_cuts)))
+
+
+word_freqs
+
+```
+
+### Build a model for words and the total owned
+
+In this step, we're going to nest our data into sub-datasets by `total_cuts`. Essentially, we're going to create a dataset of just the `total_cuts` = 150, `total_cuts` = 500, etc. 
+
+The numbers from our prior table will be used in a logistic regression, where we're going to consider the `n` value to be the total number of successes and we're going to consider the `total` value to be the total number of attempts.
+
+```{r}
+word_mods <-
+  word_freqs %>%
+  nest(data = c(total_cuts, n, total, proportion)) %>%
+  mutate(
+    model = map(data, ~ glm(cbind(n, total) ~ total_cuts, ., family = "binomial")),
+    model = map(model, tidy)
+  ) %>%
+  unnest(model) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(p.value = p.adjust(p.value))  %>%
+  arrange(-estimate)
+
+word_mods 
+```
+
+Plot the model results
+
+```{r}
+library(ggrepel)
+
+
+word_mods %>%
+  ggplot(aes(estimate, p.value)) +
+  theme_light()+
+  geom_vline(xintercept = 0, 
+             lty = 2, 
+             alpha = 0.7, 
+             color = "gray50") +
+  geom_point(alpha = 0.8, size = 2.5) +
+  scale_y_log10() +
+  geom_text_repel(aes(label = word), max.overlaps = 5)
+
+```
+
+Based on the game's description, words like new, building, city, exploration increase are associated with more sold games.
+
+Words like wargame, childrens, war, napoleonic are less likely to be associated with sold games.
+
+With that information known, let's save the top 10 words positively associated with sales and the bottom 10 words associated with sales. The idea being that if a board game is categorized with the "bottom 10 words," it's likely to not sell a lot of games.
+
+```{r}
+category_higher_words <-
+  word_mods %>%
+  filter(p.value < 0.05) %>%
+  slice_max(estimate, n = 10) %>%
+  pull(word)
+
+category_lower_words <-
+  word_mods %>%
+  filter(p.value < 0.05) %>%
+  slice_max(-estimate, n = 10) %>%
+  pull(word)
+
+
+category_higher_words
+category_lower_words
+
+```
+
+
+## Getting **description** words (feature selection)
+
+The goal here is to understand if the words used to describe the board game (in the `description` column) are related to to the total number of games sold.
+
+All the steps above are repeated here, but with a different text column.
+
+Top words used in the description:
+
+```{r}
+library(tidytext)
+
+description_tidy <- 
+  clean_details %>%
+  unnest_tokens(word, description) %>%
+  anti_join(get_stopwords()) %>%
+  # Removing this word since they're all "games"
+  filter(word != "game") %>%
+  filter(!str_detect(word, "\\d")) %>%
+  mutate(word = gsub("[[:punct:]]", "", word)) 
+
+
+
+description_tidy %>%
+  count(word, sort = TRUE)  
+  
+```
+
+```{r}
+description_top_words <-
+  description_tidy %>%
+  count(word, sort = TRUE) %>%
+  slice_max(n, n = 100) %>%
+  pull(word)
+
+
+description_word_freqs <-
+  description_tidy %>%
+  count(word, total_cuts) %>%
+  complete(word, total_cuts, fill = list(n = 0)) %>%
+  group_by(total_cuts) %>%
+  mutate(
+    total = sum(n),
+    proportion = n / total
+  ) %>%
+  ungroup() %>%
+  filter(word %in% description_top_words) %>%
+  # Need to turn the total_cuts into a numeric data for prediction
+  mutate(total_cuts = as.numeric(as.character(total_cuts)))
+
+
+description_word_freqs
+
+```
+
+
+
+### Build a model for words and the total owned
+
+```{r}
+description_word_mods <-
+  description_word_freqs %>%
+  nest(data = c(total_cuts, n, total, proportion)) %>%
+  mutate(
+    model = map(data, ~ glm(cbind(n, total) ~ total_cuts, ., family = "binomial")),
+    model = map(model, tidy)
+  ) %>%
+  unnest(model) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(p.value = p.adjust(p.value))  %>%
+  arrange(-estimate)
+
+description_word_mods 
+```
+
+Plot the model results
+
+```{r}
+library(ggrepel)
+
+
+description_word_mods %>%
+  ggplot(aes(estimate, p.value)) +
+  theme_light()+
+  geom_vline(xintercept = 0, 
+             lty = 2, 
+             alpha = 0.7, 
+             color = "gray50") +
+  geom_point(alpha = 0.8, size = 2.5) +
+  scale_y_log10() +
+  geom_text_repel(aes(label = word), max.overlaps = 5)
+
+```
+
+Based on the game's description, words like new, building, city, actions are likely to lead to more board games sold.
+
+Words like units, battles, rules, die are less likely to lead to more board games sold.
+
+Again, we'll save the top 10 and bottom 10 description words.
+
+```{r}
+description_higher_words <-
+  description_word_mods %>%
+  filter(p.value < 0.05) %>%
+  slice_max(estimate, n = 10) %>%
+  pull(word)
+
+description_lower_words <-
+  description_word_mods %>%
+  filter(p.value < 0.05) %>%
+  slice_max(-estimate, n = 10) %>%
+  pull(word)
+
+
+description_higher_words
+description_lower_words
+
+```
+
+
+# Model
+
+Need to transform the `total` variable to as it is right-skewed and creating a more normal distribution. To do this, I'm going to take the `log10()` of our total variable.
+
+What I'm now doing in the below is creating some "Yes/No" variables relating to the board game categories and the board game description. Essentially, if the board game category is in one of the "top high" category words, we're going to return a "yes" value. If it doesn't, it's a no. We're going to do the same thing for the description as well from the information above.
+
+```{r}
+category_higher_pat <- glue::glue_collapse(category_higher_words, sep = "|")
+category_lower_pat <- glue::glue_collapse(category_lower_words, sep = "|")
+description_higher_pat <- glue::glue_collapse(description_higher_words, sep = "|")
+description_lower_pat <- glue::glue_collapse(description_lower_words, sep = "|")
+
+lm.data <- 
+  clean_details %>% 
+  mutate_if(is.character, str_to_lower) %>%
+  mutate(total = log10(total+1),
+         cat_high = str_detect(boardgamecategory, category_higher_pat) |> as.numeric(),
+         cat_low = str_detect(boardgamecategory, category_lower_pat) |> as.numeric(),
+         desc_high = str_detect(description, description_higher_pat) |> as.numeric(),
+         desc_low = str_detect(description, description_lower_pat) |> as.numeric()) %>%
+  replace_na(list(cat_high = 0, cat_low= 0,
+                  desc_high = 0, desc_low = 0)) %>%
+  mutate(cat_high = as.factor(cat_high),
+         cat_low = as.factor(cat_low),
+         desc_high = as.factor(desc_high),
+         desc_low = as.factor(desc_low))
+
+lm.model <- lm(total ~ minplayers + maxplayers + cat_high + cat_low + desc_high + desc_low + playingtime + minage,  
+                data =lm.data)
+
+summary(lm.model)
+
+```
+
+From these model results
+
+- As the minimum number of players required to play increases, it has a negative relationship against total sales
+- We can see that the feature engingeering we did earlier with trying to understand what words are the best to use have impacts that we would expect
+
