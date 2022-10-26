@@ -13,10 +13,12 @@ details <- read_csv("games_detailed_info.csv")%>% janitor::clean_names()
 
 # Preparing the Data
 
-**The Goal** \>\> Can we predict how many board games we can sell based
-on the data elements we have. As a business, it would be important for
-us to know what variables of interest drive sales for our customers as
-we go about creating new board games.
+**The Goal**
+
+> > Can we predict how many board games we can sell based on the data
+> > elements we have. As a business, it would be important for us to
+> > know what variables of interest drive sales for our customers as we
+> > go about creating new board games.
 
 I’m going to clean up the data and create some factor variables. I’m
 going to combine the two columns from the game details `Owned` and
